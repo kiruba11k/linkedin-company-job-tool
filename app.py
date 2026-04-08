@@ -10,7 +10,9 @@ from urllib.robotparser import RobotFileParser
 from groq import Groq
 
 
-
+# -------------------------
+# SCRAPER FUNCTIONS
+# -------------------------
 
 def can_fetch(url, user_agent='*'):
     rp = RobotFileParser()
@@ -40,6 +42,7 @@ def fetch_job_description(job_url):
 
 
 def fetch_linkedin_jobs(keyword, location, start=0):
+
     base_url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
 
     params = {
@@ -66,7 +69,8 @@ def parse_job_postings(job_postings_html):
 
     for job_li_element in job_li_elements:
 
-        link_el = job_li_element.select_one('a[data-tracking-control-name="public_jobs_jserp-result_search-card"]')
+        link_el = job_li_element.select_one(
+            'a[data-tracking-control-name="public_jobs_jserp-result_search-card"]')
         title_el = job_li_element.select_one("h3.base-search-card__title")
         company_el = job_li_element.select_one("h4.base-search-card__subtitle")
         location_el = job_li_element.select_one("span.job-search-card__location")
@@ -93,6 +97,7 @@ def parse_job_postings(job_postings_html):
 
 
 def save_to_csv(data, filename="linkedin_jobs.csv"):
+
     if not data:
         return
 
@@ -107,8 +112,9 @@ def save_to_csv(data, filename="linkedin_jobs.csv"):
         dict_writer.writerows(data)
 
 
-
-
+# -------------------------
+# LLM PROMPT
+# -------------------------
 
 ERP_PROMPT = """
 You are an expert ERP job filter.
@@ -145,7 +151,7 @@ Return JSON:
 
 
 # -------------------------
-# GROQ ERP FILTER
+# GROQ FILTER
 # -------------------------
 
 def erp_filter(description, client):
@@ -154,16 +160,13 @@ def erp_filter(description, client):
 
         completion = client.chat.completions.create(
 
-            model="Llama 3.3 70B Versatile",
+            model="llama3-70b-8192",
 
             response_format={"type": "json_object"},
 
             messages=[
-
                 {"role": "system", "content": ERP_PROMPT},
-
                 {"role": "user", "content": description}
-
             ]
         )
 
@@ -178,12 +181,11 @@ def erp_filter(description, client):
         return "NO", "LLM parsing error"
 
 
-
 # -------------------------
 # MAIN SCRAPER PIPELINE
 # -------------------------
 
-def run_scraper(company, location, pages, api_key):
+def run_scraper(company, location, pages, api_key, status_box, progress_bar):
 
     client = Groq(api_key=api_key)
 
@@ -191,7 +193,14 @@ def run_scraper(company, location, pages, api_key):
 
     all_jobs = []
 
+    total_steps = len(erp_keywords) * pages
+    step = 0
+
+    status_box.update(label="Initializing scraping pipeline", state="running")
+
     for erp in erp_keywords:
+
+        status_box.update(label=f"Searching jobs for ERP vendor: {erp}", state="running")
 
         keyword = f"{erp} hiring in {company}"
 
@@ -201,7 +210,11 @@ def run_scraper(company, location, pages, api_key):
 
             try:
 
+                status_box.update(label="Fetching job listings from LinkedIn", state="running")
+
                 html = fetch_linkedin_jobs(keyword, location, start)
+
+                status_box.update(label="Parsing job postings", state="running")
 
                 jobs = parse_job_postings(html)
 
@@ -209,6 +222,8 @@ def run_scraper(company, location, pages, api_key):
                     break
 
                 for job in jobs:
+
+                    status_box.update(label="Analyzing job description using LLM", state="running")
 
                     decision, reason = erp_filter(job["description"], client)
 
@@ -218,10 +233,15 @@ def run_scraper(company, location, pages, api_key):
                     if decision == "YES":
                         all_jobs.append(job)
 
+                step += 1
+                progress_bar.progress(step / total_steps)
+
                 time.sleep(5)
 
             except Exception as e:
                 print(e)
+
+    status_box.update(label="Preparing final dataset", state="running")
 
     df = pd.DataFrame(all_jobs)
 
@@ -229,6 +249,9 @@ def run_scraper(company, location, pages, api_key):
 
     st.session_state["data"] = df
 
+    progress_bar.progress(1.0)
+
+    status_box.update(label="Scraping completed", state="complete")
 
 
 # -------------------------
@@ -248,23 +271,30 @@ pages = st.number_input("Pages to Scrape", 1, 10, 2)
 groq_key = st.secrets.get("Groq")
 
 
+# -------------------------
+# START SCRAPER
+# -------------------------
+
 if st.button("Start Scraping"):
 
     st.session_state["data"] = None
 
+    status_box = st.status("Starting pipeline", expanded=True)
+
+    progress_bar = st.progress(0)
+
     thread = threading.Thread(
         target=run_scraper,
-        args=(company, location, pages, groq_key)
+        args=(company, location, pages, groq_key, status_box, progress_bar)
     )
 
     thread.start()
 
-    st.success("Scraping started in background. You can switch tabs.")
-
+    st.write("Scraping is running in background.")
 
 
 # -------------------------
-# OUTPUT TABLE
+# OUTPUT RESULTS
 # -------------------------
 
 if "data" in st.session_state and st.session_state["data"] is not None:
@@ -278,12 +308,8 @@ if "data" in st.session_state and st.session_state["data"] is not None:
     csv = df.to_csv(index=False).encode("utf-8")
 
     st.download_button(
-
         label="Download CSV",
-
         data=csv,
-
         file_name="erp_jobs_filtered.csv",
-
         mime="text/csv"
     )
