@@ -8,6 +8,7 @@ import json
 from bs4 import BeautifulSoup
 from urllib.robotparser import RobotFileParser
 from groq import Groq
+from concurrent.futures import ThreadPoolExecutor
 
 
 # -------------------------
@@ -31,7 +32,11 @@ def fetch_job_description(job_url):
 
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, "html.parser")
-            description_tag = soup.select_one(".description__text") or soup.select_one(".show-more-less-html__markup")
+
+            description_tag = (
+                soup.select_one(".description__text")
+                or soup.select_one(".show-more-less-html__markup")
+            )
 
             return description_tag.get_text(separator="\n", strip=True) if description_tag else "Description not found"
 
@@ -70,7 +75,8 @@ def parse_job_postings(job_postings_html):
     for job_li_element in job_li_elements:
 
         link_el = job_li_element.select_one(
-            'a[data-tracking-control-name="public_jobs_jserp-result_search-card"]')
+            'a[data-tracking-control-name="public_jobs_jserp-result_search-card"]'
+        )
         title_el = job_li_element.select_one("h3.base-search-card__title")
         company_el = job_li_element.select_one("h4.base-search-card__subtitle")
         location_el = job_li_element.select_one("span.job-search-card__location")
@@ -78,48 +84,52 @@ def parse_job_postings(job_postings_html):
 
         job_url = link_el["href"].split('?')[0] if link_el else None
 
-        description = "N/A"
-
-        if job_url:
-            description = fetch_job_description(job_url)
-            time.sleep(10)
-
         job_postings.append({
             "title": title_el.text.strip() if title_el else None,
             "company": company_el.text.strip() if company_el else None,
             "location": location_el.text.strip() if location_el else None,
             "publication_date": date_el["datetime"] if date_el else None,
             "url": job_url,
-            "description": description
+            "description": "Pending"
         })
 
     return job_postings
 
 
-def save_to_csv(data, filename="linkedin_jobs.csv"):
+# -------------------------
+# PARALLEL DESCRIPTION SCRAPING
+# -------------------------
 
-    if not data:
-        return
+def fetch_descriptions_parallel(jobs, status_box):
 
-    keys = data[0].keys()
+    def task(job):
+        if job["url"]:
+            status_box.update(
+                label=f"Fetching description: {job['title']}",
+                state="running"
+            )
+            job["description"] = fetch_job_description(job["url"])
+            time.sleep(1)
+        else:
+            job["description"] = "No URL found"
 
-    with open(filename, 'w', newline='', encoding='utf-8') as output_file:
+        return job
 
-        dict_writer = csv.DictWriter(output_file, fieldnames=keys)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        jobs = list(executor.map(task, jobs))
 
-        dict_writer.writeheader()
-
-        dict_writer.writerows(data)
+    return jobs
 
 
 # -------------------------
-# LLM PROMPT
+# ERP PROMPT
 # -------------------------
 
 ERP_PROMPT = """
 You are an expert ERP job filter.
 
-Task: Analyze the job description and determine if it is a TRUE ERP-SPECIFIC ROLE.
+Task:
+Analyze each job description and determine if it is a TRUE ERP-SPECIFIC ROLE.
 
 STRICT CRITERIA:
 
@@ -141,105 +151,145 @@ Say NO if:
 - Master data roles
 - ERP mentioned as experience
 
-Return JSON:
+Return STRICT JSON array only in this format:
 
-{
-"erp_match": "YES or NO",
-"reason": "short explanation"
-}
+[
+  {
+    "erp_match": "YES",
+    "reason": "short explanation"
+  }
+]
 """
 
 
 # -------------------------
-# GROQ FILTER
+# BATCH LLM FILTER
 # -------------------------
 
-def erp_filter(description, client):
+def batch_llm_filter(jobs, client):
 
     try:
 
+        batched_input = []
+
+        for idx, job in enumerate(jobs):
+            batched_input.append(
+                f"""
+                JOB {idx + 1}
+                Title: {job['title']}
+                Description: {job['description']}
+                """
+            )
+
         completion = client.chat.completions.create(
-
             model="llama3-70b-8192",
-
             response_format={"type": "json_object"},
-
             messages=[
-                {"role": "system", "content": ERP_PROMPT},
-                {"role": "user", "content": description}
+                {
+                    "role": "system",
+                    "content": ERP_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": "\n\n".join(batched_input)
+                }
             ]
         )
 
-        result = completion.choices[0].message.content
+        result = completion.choices[0].message.content.strip()
 
-        data = json.loads(result)
+        parsed = json.loads(result)
 
-        return data["erp_match"], data["reason"]
+        if isinstance(parsed, dict):
+            parsed = parsed.get("results", [])
+
+        return parsed
 
     except Exception as e:
+        print("Batch LLM error:", e)
 
-        return "NO", "LLM parsing error"
+        return [
+            {
+                "erp_match": "NO",
+                "reason": "LLM parsing error"
+            }
+            for _ in jobs
+        ]
 
 
 # -------------------------
 # MAIN SCRAPER PIPELINE
 # -------------------------
 
-def run_scraper(company, location, pages, api_key, status_box, progress_bar):
+def run_scraper(keyword, location, pages, api_key, status_box, progress_bar):
 
     client = Groq(api_key=api_key)
 
-    erp_keywords = ["sap", "workday", "oracle", "dynamics", "infor", "sage"]
-
     all_jobs = []
 
-    total_steps = len(erp_keywords) * pages
+    total_steps = pages
     step = 0
 
     status_box.update(label="Initializing scraping pipeline", state="running")
 
-    for erp in erp_keywords:
+    for i in range(pages):
 
-        status_box.update(label=f"Searching jobs for ERP vendor: {erp}", state="running")
+        start = i * 25
 
-        keyword = f"{erp} hiring in {company}"
+        try:
 
-        for i in range(pages):
+            status_box.update(
+                label=f"Fetching LinkedIn page {i + 1}",
+                state="running"
+            )
 
-            start = i * 25
+            html = fetch_linkedin_jobs(keyword, location, start)
 
-            try:
+            status_box.update(
+                label="Parsing job postings",
+                state="running"
+            )
 
-                status_box.update(label="Fetching job listings from LinkedIn", state="running")
+            jobs = parse_job_postings(html)
 
-                html = fetch_linkedin_jobs(keyword, location, start)
+            if not jobs:
+                break
 
-                status_box.update(label="Parsing job postings", state="running")
+            status_box.update(
+                label="Scraping job descriptions in parallel",
+                state="running"
+            )
 
-                jobs = parse_job_postings(html)
+            jobs = fetch_descriptions_parallel(jobs, status_box)
 
-                if not jobs:
-                    break
+            status_box.update(
+                label="Running batch LLM filtering",
+                state="running"
+            )
 
-                for job in jobs:
+            batch_size = 10
 
-                    status_box.update(label="Analyzing job description using LLM", state="running")
+            for batch_start in range(0, len(jobs), batch_size):
 
-                    decision, reason = erp_filter(job["description"], client)
+                batch_jobs = jobs[batch_start: batch_start + batch_size]
 
-                    job["erp_match"] = decision
-                    job["reason"] = reason
+                llm_results = batch_llm_filter(batch_jobs, client)
 
-                    if decision == "YES":
+                for job, llm_result in zip(batch_jobs, llm_results):
+
+                    job["erp_match"] = llm_result.get("erp_match", "NO")
+                    job["reason"] = llm_result.get("reason", "No reason")
+
+                    if job["erp_match"] == "YES":
                         all_jobs.append(job)
 
-                step += 1
-                progress_bar.progress(step / total_steps)
+            step += 1
+            progress_bar.progress(step / total_steps)
 
-                time.sleep(5)
+            time.sleep(1)
 
-            except Exception as e:
-                print(e)
+        except Exception as e:
+            print(e)
 
     status_box.update(label="Preparing final dataset", state="running")
 
@@ -258,15 +308,28 @@ def run_scraper(company, location, pages, api_key, status_box, progress_bar):
 # STREAMLIT UI
 # -------------------------
 
+st.set_page_config(page_title="ERP Hiring Intelligence Scraper", layout="wide")
+
 st.title("ERP Hiring Intelligence Scraper")
 
 st.write("Scrape LinkedIn ERP hiring signals and filter using Groq LLM")
 
-company = st.text_input("Company Name", "MAG (Airports Group)")
+keyword = st.text_input(
+    "Keyword",
+    "sap hiring in MAG (Airports Group)"
+)
 
-location = st.text_input("Location", "United Kingdom")
+location = st.text_input(
+    "Location",
+    "United Kingdom"
+)
 
-pages = st.number_input("Pages to Scrape", 1, 10, 2)
+pages = st.number_input(
+    "Pages to Scrape",
+    min_value=1,
+    max_value=10,
+    value=2
+)
 
 groq_key = st.secrets.get("Groq")
 
@@ -285,7 +348,14 @@ if st.button("Start Scraping"):
 
     thread = threading.Thread(
         target=run_scraper,
-        args=(company, location, pages, groq_key, status_box, progress_bar)
+        args=(
+            keyword,
+            location,
+            pages,
+            groq_key,
+            status_box,
+            progress_bar
+        )
     )
 
     thread.start()
@@ -303,13 +373,13 @@ if "data" in st.session_state and st.session_state["data"] is not None:
 
     st.subheader("Filtered ERP Jobs")
 
-    st.dataframe(df)
+    st.dataframe(df, use_container_width=True)
 
-    csv = df.to_csv(index=False).encode("utf-8")
+    csv_data = df.to_csv(index=False).encode("utf-8")
 
     st.download_button(
         label="Download CSV",
-        data=csv,
+        data=csv_data,
         file_name="erp_jobs_filtered.csv",
         mime="text/csv"
     )
